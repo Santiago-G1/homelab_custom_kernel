@@ -6,7 +6,9 @@ BAR1 each) initialize at the same time** on an Ivy Bridge class machine with a
 place one of them.
 
 Tested on: Intel H61M-I + i5-3570, 16 GB DDR3, 2× Tesla P100-PCIE-16GB, Proxmox
-VE 9.2.
+VE 9.2, with **6.14.11** (vanilla + patches) and **7.0.14** (vanilla + patches,
+currently running). The stock Proxmox 7.0.14 kernel does **not** fix this by
+itself: it leaves both BAR1 at `0M` and the nvidia probe fails for both cards.
 
 ## The problem
 
@@ -60,8 +62,23 @@ windows come back as `[disabled]`.
 ## Build
 
 ```sh
-./scripts/build.sh                    # KVER=6.14.11 CONFIG=/boot/config-$(uname -r) JOBS=2
+./scripts/build.sh                    # KVER=7.0.14 CONFIG=/boot/config-$(uname -r) JOBS=2
 ```
+
+The patches live under `patches/<version>/`, one series per kernel version, and
+`build.sh` picks the one that matches `KVER`.
+
+A full distro config takes ~3 h on four cores and most of it is stuff this kind
+of machine never uses. `scripts/trim-config.sh` drops the GPU drivers, sound,
+media, wireless, the NIC vendors it does not have, the HBA drivers, the
+filesystems it does not mount and `DEBUG_INFO`, and the same build then takes
+**40 minutes** (25 min more for i915 if you want the iGPU available). The script
+lists what it removes and re-checks that MD/DM, AHCI, EXT4, bridge/netfilter,
+overlay, AppArmor, KVM and the Realtek NIC are still there.
+
+Do **not** use `make localmodconfig` for this: `dm-mod` is built-in, so it is
+not in `lsmod`, so `localmodconfig` disables `CONFIG_MD` — and the machine no
+longer boots (root is an LVM thin volume).
 
 It fetches the tarball from kernel.org, applies `patches/*` in order, uses your
 running config as the base and runs `make olddefconfig`. Requirements are the
@@ -77,6 +94,16 @@ hungry one.
 
 `modules_install` with `INSTALL_MOD_STRIP=1`, `bzImage`/`System.map`/`.config`
 into `/boot`, `depmod`, `update-initramfs -c`, `update-grub`.
+
+On 7.0.14 the modules have to be built against *this* tree too, because
+`modversions` CRCs come from it:
+
+* **ZFS**: upstream `2.4.4` declares `Linux-Maximum: 7.2` and builds against
+  7.0.14; `./configure --with-config=kernel --with-linux=<tree>` then `make`,
+  and the module goes to `extra/zfs/`. The `zfs.ko` that ships in Proxmox's
+  kernel package only matches the distro kernel (`-pve` vermagic).
+* **nvidia**: 580.159.04 (the last branch with Pascal) builds for 7.0.14 with
+  `make SYSSRC=<tree> modules`; modules go to `updates/dkms/`.
 
 Watch out for GRUB on Proxmox: `feature_menuentry_id` is not defined there, so
 **`menuentry --id` is ignored** and any `GRUB_DEFAULT` by id silently falls back

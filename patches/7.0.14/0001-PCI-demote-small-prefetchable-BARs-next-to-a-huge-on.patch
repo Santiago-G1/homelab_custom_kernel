@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Santiago-G1 <254106790+Santiago-G1@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:40:10 -0500
+Subject: [PATCH 1/3] PCI: demote small prefetchable BARs next to a huge one
+
+A device can expose a huge prefetchable BAR (the 16 GiB BAR1 of a Tesla
+P100 is one) and a small prefetchable one (its 32 MiB BAR3). The bridge
+window is then sized "huge + small", and on a platform whose physical
+address space is small (36 bits / 64 GiB: Ivy Bridge and its siblings)
+that window cannot be tiled: it has to be aligned to the huge BAR's size,
+so the second window would start 16 GiB after a start that is not a 16 GiB
+multiple, and one of the two cards never gets its BAR placed.
+
+Prefetchability of 32 MiB is worth nothing next to that, so mark it
+non-prefetchable: the small BAR then rides in the ordinary memory window
+and each huge BAR gets a window of exactly its own size, which tiles.
+
+Devices without a huge BAR but with a prefetchable BAR smaller than 64 KiB
+get the same treatment: such a window is useless on its own and can end up
+sitting exactly where a big window is needed later.
+---
+ drivers/pci/probe.c | 53 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index b470764..8e3886a 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -339,6 +339,57 @@ out:
+ 	return (res->flags & IORESOURCE_MEM_64) ? 1 : 0;
+ }
+ 
++/*
++ * A device with a huge prefetchable BAR that also exposes a small prefetchable
++ * one forces its bridge window to be "huge + small". Such a window cannot be
++ * aligned to the huge BAR's size on a platform with a small physical address
++ * space (36 bits / 64 GiB, e.g. Ivy Bridge), and two of them cannot tile: the
++ * second window would have to start 16 GiB after a start that is not a 16 GiB
++ * multiple, so the huge BAR never gets placed and the card stays unusable.
++ *
++ * Prefetchability of a few MiB is worthless next to that, so demote it: the
++ * small BAR then fits the ordinary window and each huge BAR gets a window of
++ * exactly its own size, which tiles perfectly.
++ */
++static void pci_demote_small_pref_bars(struct pci_dev *dev, unsigned int howmany)
++{
++	resource_size_t biggest = 0;
++	unsigned int i;
++
++	for (i = 0; i < howmany; i++) {
++		resource_size_t size = resource_size(&dev->resource[i]);
++
++		if (size > biggest)
++			biggest = size;
++	}
++	if (biggest < SZ_8G) {
++		/*
++		 * Even without a huge sibling, a prefetchable BAR of a few KiB is
++		 * worthless and its window can end up in the middle of the
++		 * address space a big window needs later.
++		 */
++		for (i = 0; i < howmany; i++) {
++			struct resource *res = &dev->resource[i];
++
++			if ((res->flags & IORESOURCE_PREFETCH) &&
++			    resource_size(res) < SZ_64K)
++				res->flags &= ~IORESOURCE_PREFETCH;
++		}
++		return;
++	}
++
++	for (i = 0; i < howmany; i++) {
++		struct resource *res = &dev->resource[i];
++
++		if ((res->flags & IORESOURCE_PREFETCH) &&
++		    resource_size(res) < SZ_1G) {
++			pci_info(dev, "BAR %u (%pa) is small next to BAR of %pa, marking it non-prefetchable\n",
++				 i, &res->start, &biggest);
++			res->flags &= ~IORESOURCE_PREFETCH;
++		}
++	}
++}
++
+ static __always_inline void pci_read_bases(struct pci_dev *dev,
+ 					   unsigned int howmany, int rom)
+ {
+@@ -386,6 +437,8 @@ static __always_inline void pci_read_bases(struct pci_dev *dev,
+ 				IORESOURCE_READONLY | IORESOURCE_SIZEALIGN;
+ 		__pci_read_base(dev, pci_bar_mem32, res, rom, &rombar);
+ 	}
++
++	pci_demote_small_pref_bars(dev, howmany);
+ }
+ 
+ static void pci_read_bridge_io(struct pci_dev *dev, struct resource *res,

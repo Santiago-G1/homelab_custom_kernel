@@ -26,7 +26,7 @@ if [ ! -f .config ]; then
     cp "$CONFIG" .config
 fi
 
-for p in ../patches/*.patch; do
+for p in ../${PATCHDIR:-patches/$KVER}/*.patch; do
     echo "== $(basename "$p")"
     if git rev-parse --git-dir >/dev/null 2>&1; then
         git am -q "$p"

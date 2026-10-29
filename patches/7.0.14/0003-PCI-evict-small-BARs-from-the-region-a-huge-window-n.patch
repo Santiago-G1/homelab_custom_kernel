@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Santiago-G1 <254106790+Santiago-G1@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:40:10 -0500
+Subject: [PATCH 3/3] PCI: evict small BARs from the region a huge window needs
+
+With two 16 GiB prefetchable windows to place, the only slots that fit
+below the 64 GiB ceiling of a 36-bit platform are at 32 GiB and 48 GiB.
+The generic allocator does find them, but only if nothing small is parked
+in the middle of those slots: here the firmware put the HDA audio and the
+SMBus BARs there, which fragments the hole and leaves the second window
+unassignable ("bridge window: can't assign; no space").
+
+Before the generic assignment runs, walk the bus and release the memory
+resources smaller than SZ_8G that overlap [SZ_16G, 64 GiB). They are
+re-assigned from scratch a few lines later, long before any driver is
+bound, so nothing needs to know they moved.
+---
+ drivers/pci/setup-bus.c | 50 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/drivers/pci/setup-bus.c b/drivers/pci/setup-bus.c
+index 4af279d..9c4a97c 100644
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -1500,6 +1500,46 @@ void __pci_bus_size_bridges(struct pci_bus *bus, struct list_head *realloc_head)
+ 	}
+ }
+ 
++/*
++ * Two Tesla P100 need a 16 GiB prefetchable window each, aligned to 16 GiB.
++ * On this platform (x86, 36-bit physical address space) the only slots that
++ * fit below the 64 GiB ceiling are 32 GiB and 48 GiB, and the generic
++ * allocator does find them bottom-up - unless the firmware has parked tiny
++ * BARs right in the middle of those slots (HDA and SMBus here), which
++ * fragments the holes and leaves the second window unassignable.
++ *
++ * So walk the bus before the generic assignment runs and release the small
++ * PCI resources that sit where a huge window has to go. They are re-assigned
++ * from scratch a few lines later, long before any driver is bound.
++ */
++#define PCI_36BIT_LIMIT		(SZ_16G * 4)
++#define PCI_HUGE_WINDOW_MIN	SZ_8G
++
++static int pci_evict_small_mem(struct pci_dev *dev, void *data)
++{
++	const struct resource *slot = data;
++	unsigned int i;
++
++	for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++		struct resource *r = &dev->resource[i];
++
++		if (!r->parent || !(r->flags & IORESOURCE_MEM))
++			continue;
++		/* Never touch a window that is itself huge. */
++		if (resource_size(r) >= PCI_HUGE_WINDOW_MIN)
++			continue;
++		if (!resource_overlaps(r, slot))
++			continue;
++
++		pci_info(dev, "releasing %s %pR to leave room for a huge window\n",
++			 pci_resource_name(dev, i), r);
++		release_resource(r);
++		r->flags |= IORESOURCE_UNSET;
++	}
++
++	return 0;
++}
++
+ void pci_bus_size_bridges(struct pci_bus *bus)
+ {
+ 	__pci_bus_size_bridges(bus, NULL);
+@@ -2246,6 +2286,16 @@ void pci_assign_unassigned_root_bus_resources(struct pci_bus *bus)
+ 		 */
+ 		__pci_bus_size_bridges(bus, add_list);
+ 
++		{
++			struct resource slot = {
++				.start = SZ_16G,
++				.end = PCI_36BIT_LIMIT - 1,
++				.flags = IORESOURCE_MEM,
++			};
++
++			pci_walk_bus(bus, pci_evict_small_mem, &slot);
++		}
++
+ 		pci_root_bus_distribute_available_resources(bus, add_list);
+ 
+ 		/* Depth last, allocate resources and update the hardware. */
