@@ -1,0 +1,7 @@
+GPL-2.0
+
+The patches in this repository modify the Linux kernel
+(drivers/pci/probe.c and drivers/pci/setup-bus.c) and are therefore
+derivative works of it, distributed under the GNU General Public License
+version 2. The full text is the one shipped with the kernel in
+LICENSES/preferred/GPL-2.0 of the corresponding source tree.

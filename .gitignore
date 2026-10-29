@@ -1,0 +1,5 @@
+linux-*/
+*.tar.xz
+*.o
+*.ko
+.config.old

@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Santiago-G1 <254106790+Santiago-G1@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:16:19 -0500
+Subject: [PATCH 2/3] PCI: release prefetchable windows that have nothing
+ prefetchable behind
+
+Firmware can leave a prefetchable window assigned to a bridge even when no
+device below it has a prefetchable BAR (this board ships a 1 MiB one for
+the NIC port, parked at 32.5 GiB). The kernel keeps it because it is a
+valid resource, and on a small address space it is exactly in the way of
+the huge windows the GPUs need.
+
+Walk the buses before sizing them: when nothing behind a bridge is
+prefetchable, release its prefetchable window and let the space be reused.
+pci_setup_bridge() disables the window in hardware once its flags are
+cleared.
+---
+ drivers/pci/setup-bus.c | 45 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/pci/setup-bus.c b/drivers/pci/setup-bus.c
+index 477eb07..bed76c8 100644
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -1142,6 +1142,7 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
+ 
+ 	win_align = window_alignment(bus, b_res->flags);
+ 	min_align = calculate_mem_align(aligns, max_order);
++
+ 	min_align = max(min_align, win_align);
+ 	size0 = calculate_memsize(size, min_size, 0, 0, resource_size(b_res), min_align);
+ 
+@@ -1292,6 +1293,48 @@ handle_done:
+ 	;
+ }
+ 
++static bool pci_bus_has_pref_child(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++	struct resource *r;
++	int i;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		pci_dev_for_each_resource(dev, r, i)
++			if (r->flags & IORESOURCE_PREFETCH)
++				return true;
++	}
++
++	return false;
++}
++
++/*
++ * A prefetchable window with nothing prefetchable behind it is useless, but the
++ * firmware may still have placed it in the middle of the address space where a
++ * huge window is needed later. That makes the huge window unassignable, so drop
++ * the useless one and let its space be reused. pci_setup_bridge() disables the
++ * window in hardware once its flags are cleared.
++ */
++static void pci_drop_unused_pref_window(struct pci_bus *bus)
++{
++	struct resource *res;
++
++	if (!bus->self || pci_is_root_bus(bus) || !bus->self->subordinate)
++		return;
++	if (pci_bus_has_pref_child(bus))
++		return;
++
++	res = &bus->self->resource[PCI_BRIDGE_PREF_MEM_WINDOW];
++	if (!res->parent)
++		return;
++
++	pci_info(bus->self, "no prefetchable device behind this bridge, releasing window %pR\n",
++		 res);
++	release_resource(res);
++	res->flags = 0;
++	res->start = res->end = 0;
++}
++
+ void __pci_bus_size_bridges(struct pci_bus *bus, struct list_head *realloc_head)
+ {
+ 	struct pci_dev *dev;
+@@ -1302,6 +1345,8 @@ void __pci_bus_size_bridges(struct pci_bus *bus, struct list_head *realloc_head)
+ 	struct pci_host_bridge *host;
+ 	int hdr_type, ret;
+ 
++	pci_drop_unused_pref_window(bus);
++
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+ 		struct pci_bus *b = dev->subordinate;
+ 		if (!b)
